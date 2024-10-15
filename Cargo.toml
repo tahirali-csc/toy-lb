@@ -1,0 +1,14 @@
+[package]
+name = "toy-lb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mio = { version = "^1.0.0", features = ["os-poll", "net"] }
+thiserror = "^1.0.61"
+socket2 = "0.5.7"
+slab = "^0.4.9"
+log = "0.4.22"
+prost = "0.13.2"
+serde = { version = "^1.0.203", features = ["derive"] }
+poule = "^0.3.2"
