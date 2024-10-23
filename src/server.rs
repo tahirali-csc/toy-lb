@@ -1,10 +1,14 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::io::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use mio::{Events, Poll, Token};
-use crate::http::HttpProxy;
+use mio::event::Event;
+use mio::net::TcpStream;
+use crate::http::{AcceptError, HttpProxy};
 use crate::proxy::ProxySession;
+use crate::token_counter::TokenCounter;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
@@ -21,11 +25,15 @@ pub enum ServerError {
     // },
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ListenToken(pub usize);
+
 pub struct Server {
-    pub session_manager: SessionManager,
-    http: HttpProxy,
-    token_counter: i16,
+    pub session_manager: Rc<RefCell<SessionManager>>,
+    http: Rc<RefCell<HttpProxy>>,
+    accept_queue: VecDeque<(TcpStream, ListenToken)>,
     pub poll: Poll,
+    token_counter: Rc<RefCell<TokenCounter>>
 }
 
 pub struct ListenSession {
@@ -42,14 +50,16 @@ impl Server {
             .try_clone()
             .map_err(ServerError::CreatePoll)?;
 
-        let http = HttpProxy::new(registry);
+        let token_counter = Rc::new(RefCell::new(TokenCounter::new()));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
 
-        let sessions = SessionManager::new();
+        let http = Rc::new(RefCell::new(HttpProxy::new(registry, sessions.clone(), token_counter.clone())));
         let mut server = Server {
             session_manager: sessions,
-            token_counter: 0,
+            token_counter: token_counter,
             http,
             poll: event_loop,
+            accept_queue: VecDeque::new()
         };
         server.add_listeners();
         Ok(server)
@@ -57,17 +67,20 @@ impl Server {
 
     fn add_listeners(&mut self) {
         let listen_session = ListenSession {};
-        self.session_manager.sessions.push(Rc::new(RefCell::new(listen_session)));
-        self.token_counter += 1;
+
+        let token = self.token_counter.borrow_mut().next();
+        let token = Token(token as usize);
+
+        self.session_manager.borrow_mut().sessions.insert(token, Rc::new(RefCell::new(listen_session)));
 
         let ip = Ipv4Addr::new(127, 0, 0, 1); // Localhost IP
         let port = 8080;                      // Port number
         let addr = SocketAddr::new(ip.into(), port); // Create SocketAddr
 
-        let token = Token(self.token_counter as usize);
-        self.http.add_listener(token);
 
-        let activate_token = self.http.activate_listener(&addr);
+        self.http.borrow_mut().add_listener(token);
+
+        let activate_token = self.http.borrow_mut().activate_listener(&addr);
 
     }
 
@@ -78,20 +91,58 @@ impl Server {
             self.poll.poll(&mut events, None);
 
             for event in events.iter() {
-                println!("{:?}", event.token())
+                println!("{:?}", event.token());
+                self.ready(event.token(), event);
             }
+
+            self.create_sessions()
+        }
+    }
+
+    pub fn ready(&mut self, token: Token, event: &Event) {
+        let session_token = token.0;
+        if self.session_manager.borrow_mut().sessions.contains_key(&token) {
+            if event.is_readable() {
+                self.accept(ListenToken(token.0))
+                // println!("is_readable")
+            }
+        }
+    }
+
+    pub fn accept(&mut self, token: ListenToken) {
+        loop {
+            // match self.http.borrow_mut().accept(token) {
+            match self.http.borrow_mut().accept(token) {
+                Ok(sock) => {
+                    self.accept_queue.push_back((sock, token))
+                }
+                Err(AcceptError::WouldBlock) => {}
+                Err(other) => {}
+            }
+        }
+    }
+
+    pub fn create_sessions(&mut self) {
+        while let Some((sock, token)) = self.accept_queue.pop_back() {
+            // if self.session_manager.borrow_mut().check_limits() {
+            //
+            // }
+            // let proxy = self.http.clone();
+            let  proxy = &mut self.http;
+            proxy.borrow_mut().create_session(sock, token);
         }
     }
 }
 
 pub struct SessionManager {
-    pub sessions: Vec<Rc<RefCell<dyn ProxySession>>>,
+    // pub sessions: Vec<Rc<RefCell<dyn ProxySession>>>,
+    pub sessions: HashMap<Token, Rc<RefCell<dyn ProxySession>>>
 }
 
 impl SessionManager {
     fn new() -> SessionManager {
         SessionManager {
-            sessions: Vec::new()
+            sessions: HashMap::new()
         }
     }
 }

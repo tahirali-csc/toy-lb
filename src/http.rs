@@ -1,10 +1,15 @@
 use crate::socket::server_bind;
-use mio::net::TcpListener;
+use mio::net::{TcpListener, TcpStream};
 use mio::{Interest, Registry, Token};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
+use std::time::Duration;
+use crate::proxy::ProxySession;
+use crate::server::{ListenToken, SessionManager};
+use crate::token_counter::TokenCounter;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ListenerError {
@@ -36,6 +41,17 @@ pub enum ProxyError {
     #[error("found no listener with address {0:?}")]
     NoListenerFound(SocketAddr),
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcceptError {
+    IoError,
+    TooManySessions,
+    WouldBlock,
+    RegisterError,
+    WrongSocketAddress,
+    BufferCapacityReached,
+}
+
 pub struct HttpListener {
     address: SocketAddr,
     listener: Option<TcpListener>,
@@ -57,19 +73,79 @@ impl HttpListener {
         self.listener = Some(listener);
         Ok(self.token)
     }
+
+    fn accept(&mut self) -> Result<TcpStream, AcceptError>{
+        if let Some(ref sock) = self.listener {
+            sock.accept()
+                .map_err(|e| match e.kind() {
+                    ErrorKind::WouldBlock => AcceptError::WouldBlock,
+                    _ => {
+                        // error!("accept() IO error: {:?}", e);
+                        println!("accept() IO error: {:?}", e);
+                        AcceptError::IoError
+                    }
+                })
+                .map(|(sock, _)| sock)
+        } else {
+            println!("cannot accept connections, no listening socket available");
+            Err(AcceptError::IoError)
+        }
+    }
 }
 
 pub struct HttpProxy {
     listeners: HashMap<Token, Rc<RefCell<HttpListener>>>,
     registry: Registry,
+    sessions: Rc<RefCell<SessionManager>>,
+    pub token_counter: Rc<RefCell<TokenCounter>>,
 }
 
+impl HttpProxy {
+    pub fn create_session(&self, mut frontend_sock: TcpStream, listener_token: ListenToken) -> Result<(), AcceptError> {
+        let listener = self
+            .listeners
+            .get(&Token(listener_token.0))
+            .cloned()
+            .ok_or(AcceptError::IoError)?;
+
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+            return Err(AcceptError::IoError);
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let session_token = Token(self.token_counter.borrow_mut().next() as usize);
+        // session_manager.sessions.insert()
+
+        if let Err(err) = self.registry.register(&mut frontend_sock, session_token, Interest::READABLE | Interest::WRITABLE) {
+            return Err(AcceptError::RegisterError);
+        }
+
+        // let owned_listener = listener.borrow();
+
+        let session = HttpSession::new(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            session_token)?;
+
+        let session = Rc::new(RefCell::new(session));
+        session_manager.sessions.insert(session_token, session);
+        Ok(())
+    }
+}
 
 impl HttpProxy {
-    pub fn new(registry: Registry) -> HttpProxy {
+    pub fn new(
+        registry: Registry,
+        sessions: Rc<RefCell<SessionManager>>,
+        token_counter: Rc<RefCell<TokenCounter>>
+    ) -> HttpProxy {
         HttpProxy {
             listeners: HashMap::new(),
-            registry
+            registry,
+            sessions,
+            token_counter
         }
     }
 
@@ -99,4 +175,41 @@ impl HttpProxy {
                 listener_error
             })
     }
+
+    pub fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+        if let Some(listener) = self.listeners.get(&Token(token.0)) {
+            listener.borrow_mut().accept()
+        } else {
+            Err(AcceptError::IoError)
+        }
+    }
+}
+
+pub struct HttpSession {
+    // answers: Rc<RefCell<HttpAnswers>>,
+    configured_backend_timeout: Duration,
+    configured_connect_timeout: Duration,
+    configured_frontend_timeout: Duration,
+    frontend_token: Token,
+}
+
+impl HttpSession {
+    pub fn new(
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        configured_request_timeout: Duration,
+        token: Token,)-> Result<Self, AcceptError> {
+
+        Ok(HttpSession {
+            configured_backend_timeout,
+            configured_connect_timeout,
+            configured_frontend_timeout,
+            frontend_token: token,
+        })
+    }
+}
+
+impl ProxySession for HttpSession {
+
 }
